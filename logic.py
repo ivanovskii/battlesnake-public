@@ -91,7 +91,6 @@ def choose_move_heuristic(game_state: Dict) -> str:
             best_move = move
 
     # No safe move found -> we're cornered. Move up and hope for the best.
-    return "up"
     return best_move or "up"
 
 
