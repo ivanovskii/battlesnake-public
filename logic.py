@@ -28,6 +28,10 @@ DIRECTIONS: Dict[str, Point] = {
 HEAD_TO_HEAD_PENALTY = 10_000
 # Below this health we start actively steering toward food.
 HUNGRY_THRESHOLD = 50
+# Reward for a move that keeps our own tail reachable (anti-self-trap).
+TAIL_REACH_BONUS = 5
+# Small per-cell pull away from walls (walls are where we get trapped).
+WALL_DIST_WEIGHT = 0.2
 
 
 def get_info() -> Dict[str, str]:
@@ -61,6 +65,10 @@ def choose_move_heuristic(game_state: Dict) -> str:
     occupied = _occupied_cells(board["snakes"])
     danger = _head_to_head_cells(board["snakes"], you["id"], my_length)
     foods = [(f["x"], f["y"]) for f in board["food"]]
+    # Center bias helps when we're alone (don't run out of room at the edges)
+    # but hurts against opponents (it pulls both snakes into the same center and
+    # into head-to-heads), so only apply it when no enemy snakes are on the board.
+    alone = sum(1 for s in board["snakes"] if s["id"] != you["id"]) == 0
 
     best_move = None
     best_score = float("-inf")
@@ -77,6 +85,20 @@ def choose_move_heuristic(game_state: Dict) -> str:
         # the space we'd be moving into, we're about to trap ourselves.
         space = _flood_fill(nxt, occupied, width, height, limit=my_length + 1)
         score = float(space)
+
+        # Tail-following: if we can still reach our own tail from here, we can
+        # keep coiling without sealing ourselves in (the tail vacates as we
+        # move). This breaks the flat-scoring ties that otherwise default to
+        # "up" and walk us into a wall.
+        if _reaches_tail(nxt, you, occupied, width, height):
+            score += TAIL_REACH_BONUS
+
+        # Gentle center bias (solo only): distance to the nearest wall. Keeps us
+        # off the edges where space is easiest to run out of. Low weight so it
+        # only breaks ties left by space/tail.
+        if alone:
+            wall_dist = min(nxt[0], width - 1 - nxt[0], nxt[1], height - 1 - nxt[1])
+            score += WALL_DIST_WEIGHT * wall_dist
 
         if nxt in danger:
             score -= HEAD_TO_HEAD_PENALTY
@@ -150,6 +172,31 @@ def _flood_fill(start: Point, occupied: Set[Point], width: int, height: int, lim
             seen.add(nbr)
             stack.append(nbr)
     return count
+
+
+def _reaches_tail(start: Point, you: Dict, occupied: Set[Point], width: int, height: int) -> bool:
+    """Can we reach our own tail from ``start``?
+
+    The tail cell vacates next turn (unless we eat), so we exclude it from the
+    obstacles. If a path exists, moving here won't seal us into a dead pocket.
+    """
+    tail = (you["body"][-1]["x"], you["body"][-1]["y"])
+    if start == tail:
+        return True
+    free = occupied - {tail}
+    seen: Set[Point] = {start}
+    stack: List[Point] = [start]
+    while stack:
+        x, y = stack.pop()
+        for dx, dy in DIRECTIONS.values():
+            nbr = (x + dx, y + dy)
+            if nbr == tail:
+                return True
+            if nbr in seen or not _in_bounds(nbr, width, height) or nbr in free:
+                continue
+            seen.add(nbr)
+            stack.append(nbr)
+    return False
 
 
 def _in_bounds(p: Point, width: int, height: int) -> bool:
