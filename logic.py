@@ -1,4 +1,19 @@
-from typing import Dict, List, Set, Tuple, Optional
+"""Heuristic move-selection logic for the Battlesnake.
+
+This is a deliberately simple, rules-based policy. Everything flows through
+:func:`choose_move`, which takes the raw game state and returns one of
+``"up" | "down" | "left" | "right"``.
+
+Board coordinates: ``(0, 0)`` is the bottom-left corner.
+  up    -> y + 1
+  down  -> y - 1
+  left  -> x - 1
+  right -> x + 1
+
+Game-state schema reference: https://docs.battlesnake.com/api
+"""
+
+from typing import Dict, List, Set, Tuple
 
 Point = Tuple[int, int]
 
@@ -9,10 +24,17 @@ DIRECTIONS: Dict[str, Point] = {
     "right": (1, 0),
 }
 
+# Penalty applied to a move that could lose a head-to-head collision.
 HEAD_TO_HEAD_PENALTY = 10_000
+# Below this health we start actively steering toward food.
 HUNGRY_THRESHOLD = 50
-# Глубина дерева поиска для Minimax
-MAX_DEPTH = 3
+# Reward for a move that keeps our own tail reachable (anti-self-trap).
+TAIL_REACH_BONUS = 5
+# Small per-cell pull away from walls (walls are where we get trapped).
+WALL_DIST_WEIGHT = 0.2
+# Per-cell reward for keeping distance from equal-or-longer enemy heads. Keeps us
+# out of the sandwiches that force losing head-to-heads (multiplayer only).
+THREAT_DIST_WEIGHT = 0.5
 
 
 def get_info() -> Dict[str, str]:
@@ -28,93 +50,16 @@ def get_info() -> Dict[str, str]:
 
 
 def choose_move(game_state: Dict) -> str:
-    """
-    Основной входной хендлер Battlesnake.
-    Переключается между быстрым эвристическим режимом (на первом ходу)
-    и полноценным поиском Minimax.
-    """
-    you = game_state["you"]
-    head = (you["head"]["x"], you["head"]["y"])
-    
-    # На самом первом ходу тело может отсутствовать или состоять из одной головы
-    if len(you.get("body", [])) <= 2 or MAX_DEPTH == 0:
-        return choose_move_heuristic(game_state)[0]
-
-    best_move, _ = minimax(
-        state=game_state,
-        depth=MAX_DEPTH,
-        maximizing_player=True,
-        alpha=float("-inf"),
-        beta=float("inf")
-    )
-    
-    # Fallback на случай, если все ветки оказались тупиковыми
-    return best_move or choose_move_heuristic(game_state)[0]
+    """Return the next move using the hand-written heuristic."""
+    return choose_move_heuristic(game_state)
 
 
-def minimax(state: Dict, depth: int, maximizing_player: bool, alpha: float, beta: float) -> Tuple[Optional[str], float]:
-    """
-    Рекурсивная реализация алгоритма Minimax с альфа-бета отсечением.
-    Возвращает лучший ход и его оценку.
-    """
-    you_id = state["you"]["id"]
-    my_length = state["you"]["length"]
-    
-    # Базовый случай: достигли лимита глубины или игра окончена для нашей змеи
-    if depth == 0 or is_dead(state["you"], state["board"]):
-        return None, evaluate_state(state, you_id, my_length)
-
-    valid_moves = get_valid_moves(state["you"], state["board"])
-    if not valid_moves:
-        return None, float("-inf") if maximizing_player else float("inf")
-
-    best_move = None
-
-    if maximizing_player:
-        max_eval = float("-inf")
-        for move in valid_moves:
-            next_state = simulate_step(state, you_id, move)
-            _, eval_score = minimax(next_state, depth - 1, False, alpha, beta)
-            
-            if eval_score > max_eval:
-                max_eval = eval_score
-                best_move = move
-            
-            alpha = max(alpha, eval_score)
-            if beta <= alpha:
-                break  # Бета-отсечение
-        return best_move, max_eval
-    else:
-        min_eval = float("inf")
-        
-        # Определяем врагов (для простоты считаем, что минимизирующий игрок — это самый длинный враг)
-        enemies = [s for s in state["board"]["snakes"] if s["id"] != you_id]
-        if not enemies:
-            return best_move, evaluate_state(state, you_id, my_length)
-        
-        # Сортируем по длине, чтобы сильнейший враг делал ход первым
-        enemy = max(enemies, key=lambda x: x["length"])
-        
-        for move in get_valid_moves(enemy, state["board"]):
-            next_state = simulate_step(state, enemy["id"], move)
-            _, eval_score = minimax(next_state, depth - 1, True, alpha, beta)
-            
-            if eval_score < min_eval:
-                min_eval = eval_score
-                best_move = move
-            
-            beta = min(beta, eval_score)
-            if beta <= alpha:
-                break  # Альфа-отсечение
-                
-        return best_move, min_eval
-
-
-def choose_move_heuristic(game_state: Dict, direction: str = 'max') -> Tuple[str, float]:
-    """Урезанная эвристика для fallback-режима и оценки листьев дерева."""
+def choose_move_heuristic(game_state: Dict) -> str:
+    """Return the next move for the current turn."""
     board = game_state["board"]
     you = game_state["you"]
-    width, height = board["width"], board["height"]
+    width: int = board["width"]
+    height: int = board["height"]
 
     head: Point = (you["head"]["x"], you["head"]["y"])
     my_length: int = you["length"]
@@ -123,164 +68,73 @@ def choose_move_heuristic(game_state: Dict, direction: str = 'max') -> Tuple[str
     occupied = _occupied_cells(board["snakes"])
     danger = _head_to_head_cells(board["snakes"], you["id"], my_length)
     foods = [(f["x"], f["y"]) for f in board["food"]]
+    # Center bias helps when we're alone (don't run out of room at the edges)
+    # but hurts against opponents (it pulls both snakes into the same center and
+    # into head-to-heads), so only apply it when no enemy snakes are on the board.
+    alone = sum(1 for s in board["snakes"] if s["id"] != you["id"]) == 0
+    # Heads of enemies at least our length: moving next to these risks a lost
+    # head-to-head, so we keep our distance from them (see THREAT_DIST_WEIGHT).
+    bigger_heads = [(s["head"]["x"], s["head"]["y"]) for s in board["snakes"]
+                    if s["id"] != you["id"] and s["length"] >= my_length]
 
     best_move = None
-    best_score = float("-inf") if direction == 'max' else float("inf")
+    best_score = float("-inf")
 
     for move, (dx, dy) in DIRECTIONS.items():
         nxt = (head[0] + dx, head[1] + dy)
 
-        if not _in_bounds(nxt, width, height) or nxt in occupied:
+        if not _in_bounds(nxt, width, height):
+            continue
+        if nxt in occupied:
             continue
 
-        space = _flood_fill(nxt, occupied, width, height, limit=my_length + 5)
+        # Reachable open space from this cell. If we can't fit our own body in
+        # the space we'd be moving into, we're about to trap ourselves.
+        space = _flood_fill(nxt, occupied, width, height, limit=my_length + 1)
         score = float(space)
+
+        # Tail-following: if we can still reach our own tail from here, we can
+        # keep coiling without sealing ourselves in (the tail vacates as we
+        # move). This breaks the flat-scoring ties that otherwise default to
+        # "up" and walk us into a wall.
+        if _reaches_tail(nxt, you, occupied, width, height):
+            score += TAIL_REACH_BONUS
+
+        # Gentle center bias (solo only): distance to the nearest wall. Keeps us
+        # off the edges where space is easiest to run out of. Low weight so it
+        # only breaks ties left by space/tail.
+        if alone:
+            wall_dist = min(nxt[0], width - 1 - nxt[0], nxt[1], height - 1 - nxt[1])
+            score += WALL_DIST_WEIGHT * wall_dist
+
+        # Stay away from equal-or-longer enemy heads so we don't get sandwiched
+        # into a forced head-to-head. Farther = safer.
+        if bigger_heads:
+            threat_dist = min(_manhattan(nxt, h) for h in bigger_heads)
+            score += THREAT_DIST_WEIGHT * threat_dist
 
         if nxt in danger:
             score -= HEAD_TO_HEAD_PENALTY
 
+        # When hungry, nudge toward the closest food.
         if foods and health < HUNGRY_THRESHOLD:
             nearest = min(_manhattan(nxt, f) for f in foods)
             score += (width + height - nearest) * 2
 
-        if direction == 'max':
-            if score > best_score:
-                best_score, best_move = score, move
-        else:
-            if score < best_score:
-                best_score, best_move = score, move
+        if score > best_score:
+            best_score = score
+            best_move = move
 
-    return best_move or "up", best_score
-
-
-def simulate_step(state: Dict, acting_snake_id: str, move: str) -> Dict:
-    """
-    Создает глубокую копию состояния и применяет к указанной змее один ход.
-    Еда съедается, хвосты сдвигаются автоматически согласно правилам API.
-    """
-    new_state = deep_copy_state(state)
-    snakes = {s["id"]: s for s in new_state["board"]["snakes"]}
-    
-    if acting_snake_id not in snakes:
-        return new_state
-        
-    snake = snakes[acting_snake_id]
-    head = {"x": snake["head"]["x"], "y": snake["head"]["y"]}
-    dx, dy = DIRECTIONS[move]
-    
-    new_head = {"x": head["x"] + dx, "y": head["y"] + dy}
-    
-    # Проверяем еду до обновления тела
-    ate_food = any(f["x"] == new_head["x"] and f["y"] == new_head["y"] for f in new_state["board"]["food"])
-    
-    # Обновляем позицию
-    old_body = list(snake["body"])
-    snake["body"].insert(0, new_head)
-    snake["head"] = new_head
-    
-    if not ate_food:
-        # Если еды нет — убираем хвост (API сам присылает обновленные body со сдвинутыми хвостами,
-        # но при симуляции мы должны делать это вручную)
-        if len(snake["body"]) > 1:
-            snake["body"].pop()
-            
-    # Если съели еду — удаляем её с поля
-    if ate_food:
-        new_state["board"]["food"] = [
-            f for f in new_state["board"]["food"] 
-            if not (f["x"] == new_head["x"] and f["y"] == new_head["y"])
-        ]
-        
-    return new_state
-
-
-def deep_copy_state(state: Dict) -> Dict:
-    """Глубокое копирование только тех полей, которые нужны для расчетов."""
-    def copy_point(p): return {"x": p["x"], "y": p["y"]}
-    
-    new_you = {
-        "id": state["you"]["id"],
-        "length": state["you"]["length"],
-        "health": state["you"]["health"],
-        "head": copy_point(state["you"]["head"]),
-        "body": [copy_point(seg) for seg in state["you"]["body"]]
-    }
-    
-    new_snakes = []
-    for s in state["board"]["snakes"]:
-        new_snakes.append({
-            "id": s["id"],
-            "length": s["length"],
-            "health": s["health"],
-            "head": copy_point(s["head"]),
-            "body": [copy_point(seg) for seg in s["body"]]
-        })
-        
-    new_food = [copy_point(f) for f in state["board"]["food"]]
-        
-    return {
-        "turn": state["turn"],
-        "board": {
-            "height": state["board"]["height"],
-            "width": state["board"]["width"],
-            "snakes": new_snakes,
-            "food": new_food
-        },
-        "you": new_you
-    }
-
-
-def get_valid_moves(snake: Dict, board: Dict) -> List[str]:
-    """Возвращает список ходов, которые не приведут к мгновенному столкновению со стеной или телом."""
-    head = (snake["head"]["x"], snake["head"]["y"])
-    occupied = _occupied_cells(board["snakes"])
-    width, height = board["width"], board["height"]
-    
-    valid = []
-    for move, (dx, dy) in DIRECTIONS.items():
-        nxt = (head[0] + dx, head[1] + dy)
-        if _in_bounds(nxt, width, height) and nxt not in occupied:
-            valid.append(move)
-    return valid
-
-
-def is_dead(snake: Dict, board: Dict) -> bool:
-    """Проверка смерти змеи по правилам Battlesnake (стены, другие змеи)."""
-    head = (snake["head"]["x"], snake["head"]["y"])
-    if not _in_bounds(head, board["width"], board["height"]):
-        return True
-    
-    all_bodies = set()
-    for other in board["snakes"]:
-        for seg in other["body"]:
-            all_bodies.add((seg["x"], seg["y"]))
-            
-    return head in all_bodies
-
-
-def evaluate_state(state: Dict, my_id: str, my_length: int) -> float:
-    """
-    Функция оценки (статическая оценка) листа дерева.
-    Учитывает выживаемость, длину и количество доступной еды.
-    """
-    me = next((s for s in state["board"]["snakes"] if s["id"] == my_id), None)
-    if me is None or is_dead(me, state["board"]):
-        return float("-inf")
-        
-    score = float(len(me["body"]))
-    
-    # Бонус за еду на поле
-    score += len(state["board"]["food"]) * 5
-    
-    # Штраф, если мы короче самого длинного врага
-    longest_enemy_len = max([s["length"] for s in state["board"]["snakes"] if s["id"] != my_id] + [0])
-    if my_length < longest_enemy_len:
-        score -= (longest_enemy_len - my_length) * 10
-        
-    return score
+    # No safe move found -> we're cornered. Move up and hope for the best.
+    return best_move or "up"
 
 
 def _occupied_cells(snakes: List[Dict]) -> Set[Point]:
+    """All cells currently filled by any snake's body.
+
+    We keep tails occupied too; they only free up *next* turn and treating them
+    as solid is the conservative, safe choice for a base bot.
+    """
     occupied: Set[Point] = set()
     for snake in snakes:
         for seg in snake["body"]:
@@ -289,6 +143,12 @@ def _occupied_cells(snakes: List[Dict]) -> Set[Point]:
 
 
 def _head_to_head_cells(snakes: List[Dict], my_id: str, my_length: int) -> Set[Point]:
+    """Cells adjacent to enemy heads that are >= our length.
+
+    Moving onto one of these risks a head-to-head collision we would lose or
+    tie, so they are heavily penalized (but not forbidden — sometimes it's the
+    only move).
+    """
     danger: Set[Point] = set()
     for snake in snakes:
         if snake["id"] == my_id:
@@ -302,6 +162,10 @@ def _head_to_head_cells(snakes: List[Dict], my_id: str, my_length: int) -> Set[P
 
 
 def _flood_fill(start: Point, occupied: Set[Point], width: int, height: int, limit: int) -> int:
+    """Count open cells reachable from ``start`` (capped at ``limit``).
+
+    Used to avoid moves that would seal us into a small pocket.
+    """
     seen: Set[Point] = {start}
     stack: List[Point] = [start]
     count = 0
@@ -321,6 +185,31 @@ def _flood_fill(start: Point, occupied: Set[Point], width: int, height: int, lim
             seen.add(nbr)
             stack.append(nbr)
     return count
+
+
+def _reaches_tail(start: Point, you: Dict, occupied: Set[Point], width: int, height: int) -> bool:
+    """Can we reach our own tail from ``start``?
+
+    The tail cell vacates next turn (unless we eat), so we exclude it from the
+    obstacles. If a path exists, moving here won't seal us into a dead pocket.
+    """
+    tail = (you["body"][-1]["x"], you["body"][-1]["y"])
+    if start == tail:
+        return True
+    free = occupied - {tail}
+    seen: Set[Point] = {start}
+    stack: List[Point] = [start]
+    while stack:
+        x, y = stack.pop()
+        for dx, dy in DIRECTIONS.values():
+            nbr = (x + dx, y + dy)
+            if nbr == tail:
+                return True
+            if nbr in seen or not _in_bounds(nbr, width, height) or nbr in free:
+                continue
+            seen.add(nbr)
+            stack.append(nbr)
+    return False
 
 
 def _in_bounds(p: Point, width: int, height: int) -> bool:
